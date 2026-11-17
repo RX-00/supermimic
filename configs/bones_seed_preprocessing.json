@@ -1,0 +1,130 @@
+{
+  "description": "Chosen BONES-SEED preprocessing specification. These are not runtime training configuration keys.",
+  "dataset": {
+    "repo": "bones-studio/seed",
+    "revision": "2f59b2077b9da34dd4e43618e705c7cb962c9a66",
+    "archive": "g1.tar.gz",
+    "archive_sha256": "52580ea8bced72ea9e2ff1e7b68f01c51c7f1099581e9a46b7c87e1dec106d8a",
+    "metadata": "metadata/seed_metadata_v004.csv"
+  },
+  "sources": {
+    "paper": "https://arxiv.org/pdf/2610.28480v2",
+    "paper_source": "https://arxiv.org/src/2610.28480v2",
+    "project": "https://supermimic.github.io/",
+    "sonic_keywords": "https://github.com/NVlabs/GR00T-WholeBodyControl/blob/daf389964fa4a4545218e8405f24eb55f4912453/gear_sonic/data_process/filter_and_copy_bones_data.py",
+    "reproduction_filter": "https://github.com/CuboiLeo/SuperMimic-Reproduced/blob/3602aed6a397b3202ac052d688d47300f443a3ea/scripts/data/filter_bones_seed.py"
+  },
+  "conversion": {
+    "input_fps": 120,
+    "output_fps": 50,
+    "input_position_units": "centimeters",
+    "input_angle_units": "degrees",
+    "input_root_rotation": "SciPy Rotation.from_euler('xyz', angles, degrees=True); extrinsic xyz",
+    "output_position_units": "meters",
+    "output_joint_angle_units": "radians",
+    "output_root_quaternion_order": "wxyz"
+  },
+  "name_filter": {
+    "provenance": "Third-party assumption: full SONIC list plus the reproduction's paper-example additions. Not the authors' released list.",
+    "match": "Any case-insensitive substring in the filename stem",
+    "keywords": [
+      "230m",
+      "50cm_box_",
+      "_bed_",
+      "_box_",
+      "_ride_",
+      "_sit_",
+      "_stair",
+      "acrobatics_",
+      "bed",
+      "bike",
+      "box_",
+      "box_dips",
+      "box_hspu",
+      "box_jump",
+      "cartwheel",
+      "chair",
+      "climb",
+      "com_up_50cm",
+      "crutch",
+      "fall_from",
+      "fence",
+      "form_box",
+      "handstand",
+      "handstand_ff_",
+      "jump_off_50cm",
+      "jump_over_obstacle_",
+      "jump_to_shoulder_roll",
+      "kozak_dance",
+      "ladder",
+      "lift_crate_come_up_",
+      "look_over",
+      "monkey_jump",
+      "off_1m",
+      "off_50cm",
+      "on_1m",
+      "on_box",
+      "push_obstacle",
+      "safety_roll",
+      "scooter",
+      "seat",
+      "sit_",
+      "sitting",
+      "stair",
+      "step_on",
+      "stepdown",
+      "table",
+      "walking_on_edge"
+    ]
+  },
+  "paper_feasibility_rules": {
+    "body_height": "Minimum world z over robot body links, excluding the world body",
+    "elevated_support": {
+      "minimum_body_height_gt_m": 0.2,
+      "consecutive_frames_gte": 30
+    },
+    "ground_penetration": {
+      "any_body_height_lt_m": -0.12,
+      "or_body_height_lt_m": -0.08,
+      "fraction_gt": 0.8
+    },
+    "floating_feet": {
+      "both_foot_clearances_gt_m": 0.02,
+      "consecutive_frames_gte": 25,
+      "distance": "MuJoCo mj_geomDistance from every foot collision geometry to the z=0 plane; minimum clearance over both feet",
+      "additional_gates": "All gates below must hold on every counted frame"
+    }
+  },
+  "assumed_floating_feet_gates": {
+    "provenance": "Values from the pinned third-party filter; the paper gives no numeric thresholds for these gates.",
+    "pelvis_up_dot_world_up_gt": 0.9,
+    "pelvis_height_gt_m": 0.6,
+    "pelvis_height_lt_m": 0.85,
+    "pelvis_linear_speed_lt_m_per_s": 0.1,
+    "joint_velocity_rms_lt_rad_per_s": 0.5
+  },
+  "validation_reference": {
+    "paper": {
+      "raw_clips": 142220,
+      "after_name_filter": 129667,
+      "after_feasibility_filter": 129514,
+      "hours": 264.56
+    },
+    "locally_checked_metadata": {
+      "raw_clips": 142220,
+      "after_name_filter": 129647
+    },
+    "third_party_report_only": {
+      "after_feasibility_filter": 129491
+    },
+    "full_local_feasibility_result": {
+      "after_feasibility_filter": 129491,
+      "elevated_support_excluded": 100,
+      "ground_penetration_excluded": 44,
+      "floating_feet_excluded": 12,
+      "retained_frames_at_50_hz": 47345789,
+      "retained_hours": 263.0321611111111
+    },
+    "note": "Clip counts are observations, not targets to tune filters toward. Equal counts do not prove identical clip membership."
+  }
+}

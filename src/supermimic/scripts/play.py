@@ -5,7 +5,6 @@ from __future__ import annotations
 import glob
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
 
 import mjlab.tasks  # noqa: F401
@@ -71,7 +70,6 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     if not files:
       raise ValueError(f"No motion files matched: {cfg.motion_file}")
     command_term.motion_file = files
-    motion_names = [Path(f).stem for f in files]
     print(f"[INFO] Using {len(files)} local motion(s)")
   elif motion_artifacts:
     motion_files = []
@@ -85,6 +83,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     print(f"[INFO] Loaded {len(motion_files)} motion(s)")
 
   env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=device))
+  if cfg.motion_file is not None:
+    motion_names = env.unwrapped.command_manager.get_term("motion").motion.motion_names
 
   wm = build_world_model(runner_cfg, env, device)
   representation = wm.representation

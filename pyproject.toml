@@ -16,6 +16,10 @@ dependencies = [
     "viser>=1.0.24",
 ]
 
+[tool.uv]
+# mjviser 0.0.17 installs mujoco-core 4.x into the same package as MuJoCo 3.x.
+constraint-dependencies = ["mjviser==0.0.16"]
+
 [tool.uv.sources]
 mjlab = { path = "../mjlab_research", editable = true }
 

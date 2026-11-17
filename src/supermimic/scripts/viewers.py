@@ -81,10 +81,7 @@ class SuperMimicViewerMixin:
       adr = mj_model.joint(free_joint_id).qposadr[0]
       self.free_joint_q_adr = np.arange(adr, adr + 7)
 
-    self.step_in_rollout = 0
-    self.curr_pred_rep_state = None
-    self.curr_wm_aux = None
-    self.last_actions: torch.Tensor | None = None
+    self.reset_env_supermimic()
 
     # For per-body tracking: map entity-local body indexes to MuJoCo body IDs
     if isinstance(self.representation, MaxCoordRepresentation):
@@ -98,6 +95,8 @@ class SuperMimicViewerMixin:
     self.curr_pred_rep_state = None
     self.curr_wm_aux = None
     self.last_actions = None
+    self._gt_history: torch.Tensor | None = None
+    self._wm_history: torch.Tensor | None = None
 
   def set_task(self, name: str) -> None:
     """Switch the active task. Reroutes the actor through that task's encoder."""
@@ -231,13 +230,7 @@ class SuperMimicViewerMixin:
           self.curr_wm_aux = self.representation.extract_aux_state(curr_gt_states)
           self.curr_pred_rep_state = self.representation.represent(curr_gt_states)
           self.sim_ctx = self.sim_context.read(self.env.unwrapped)
-          self._gt_history = None
           self._wm_history = None
-
-        if self.last_actions is None:
-          self.last_actions = torch.zeros(
-            (1, self.dynamics.num_actions), device=curr_gt_states.device
-          )
 
         # Actor step on ground-truth obs.
         gt_aux = self.representation.extract_aux_state(curr_gt_states)
@@ -269,14 +262,19 @@ class SuperMimicViewerMixin:
 
         # Closed-loop actor step on the WM-predicted state.
         wm_actor_goal = self._build_actor_goal(wm_goal, self.curr_wm_aux)
-        wm_sensor = self.representation.compute_actor_sensor(
-          self.curr_pred_rep_state,
-          self.sim_ctx,
-          aux_state=self.curr_wm_aux,
-          joint_state=self.representation.joint_state(self.curr_pred_rep_state),
-          last_action=self.last_actions,
-        )
-        self._wm_history = self._advance_history(self._wm_history, wm_sensor)
+        if self._wm_history is None:
+          # A restarted prediction shares the real state and its sensor history,
+          # including the previous action. Do not fabricate a fresh-episode pad.
+          self._wm_history = self._gt_history.clone()
+        else:
+          wm_sensor = self.representation.compute_actor_sensor(
+            self.curr_pred_rep_state,
+            self.sim_ctx,
+            aux_state=self.curr_wm_aux,
+            joint_state=self.representation.joint_state(self.curr_pred_rep_state),
+            last_action=self.last_actions,
+          )
+          self._wm_history = self._advance_history(self._wm_history, wm_sensor)
         wm_actor_obs = build_actor_obs_td(
           {self.current_task: wm_actor_goal}, self._wm_history
         )
@@ -323,6 +321,8 @@ class SuperMimicViewerMixin:
           self.wm_vis_qpos = qpos
 
         self.step_in_rollout += 1
+        if dones.any():
+          self._gt_history = None
         if dones.any() or self.step_in_rollout >= self.num_steps_rollout:
           self.step_in_rollout = 0
           self.curr_wm_aux = None
