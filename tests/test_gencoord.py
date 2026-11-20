@@ -254,3 +254,43 @@ class TestProprioNoiseSpecConsistency:
       else:
         assert term.noise.n_min == -half, name
         assert term.noise.n_max == half, name
+
+
+def test_motion_goal_at_turn_clip_end_and_following_reset():
+  from types import SimpleNamespace
+
+  from supermimic.representations import (
+    _assemble_goal,
+    motion_anchor_window,
+    motion_goal_window,
+  )
+
+  frames = torch.arange(18, dtype=torch.float32)
+  heading = frames * 0.1
+  root_quats = torch.stack(
+    [torch.cos(heading / 2), frames * 0, frames * 0, torch.sin(heading / 2)], -1
+  )
+  motion = SimpleNamespace(
+    joint_pos=frames[:, None],
+    joint_vel=-frames[:, None],
+    motion_ends=torch.tensor([7, 18]),
+    root_pos_w=torch.zeros(18, 3),
+    root_quat_w=root_quats,
+  )
+  # A turning robot near the end of clip 0, and a freshly reset slot at clip 1.
+  t = torch.tensor([5, 7])
+  pelvis = root_quats[torch.tensor([3, 9])]
+  content = motion_goal_window(motion, t)
+  _, goal = _assemble_goal(
+    content, torch.zeros(2, 3), pelvis, *motion_anchor_window(motion, t)
+  )
+  expected_indices = torch.tensor([[5] + [6] * 9, [7, 12] + [17] * 8])
+  expected_joints = torch.stack(
+    [frames[expected_indices], -frames[expected_indices]], -1
+  )
+  torch.testing.assert_close(goal[:, :20], expected_joints.flatten(1))
+  yaw = heading[expected_indices] - heading[torch.tensor([3, 9])][:, None]
+  expected_rot = torch.stack(
+    [yaw.cos(), -yaw.sin(), yaw.sin(), yaw.cos(), yaw * 0, yaw * 0], -1
+  )
+  torch.testing.assert_close(goal[:, 20:], expected_rot.flatten(1))

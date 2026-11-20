@@ -202,3 +202,14 @@ class TestRepresentationApiContract:
     env._update_goal()
     assert torch.isfinite(env._wm_goal_obs).all()
     assert torch.isfinite(env._task_goal_obs["motion"]).all()
+
+
+def test_imagination_reset_shares_latest_sample_only_at_first_frame():
+  env = _make_env(history_length=10)
+  env.share_reset_sensor = True
+  window, padded = make_mock_buffer().sample_causal(10, BATCH)
+  padded[0, :-1] = True
+  env.replay_buffer.sample_causal = lambda length, batch: (window, padded)
+  history = env.reset()["history"]
+  torch.testing.assert_close(history[0], history[0, -1].expand_as(history[0]))
+  torch.testing.assert_close(history[1, :-1], window["actor_obs"][1, :-1])

@@ -27,6 +27,12 @@ class WorldModelLearnerCfg:
   num_batches: int = 10
   batch_size: int = 2048
   horizon: int = 8
+  horizon_counts_transitions: bool = False
+  all_adam: bool = False
+
+  @property
+  def window_records(self) -> int:
+    return self.horizon + int(self.horizon_counts_transitions)
 
   # Loss Weights (Bryson's Rule) — integrated root pose, both representations
   nominal_error_root_pose_pos: float = 0.01
@@ -59,7 +65,9 @@ class WorldModelLearner:
     self.device = device
 
     self._all_params = list(dynamics.parameters())
-    self.optimizers = build_optimizers([dynamics], self.cfg.lr, device=self.device)
+    self.optimizers = build_optimizers(
+      [dynamics], self.cfg.lr, device=self.device, all_adam=cfg.all_adam
+    )
 
     # Bryson's rule: each named channel group is weighted 1 / nominal_error^2.
     self.loss_group_weights = {

@@ -14,14 +14,17 @@ from supermimic.learners.learner_utils import (
   _optimize_step,
   build_optimizers,
   graph_state,
+  step_with_gradients,
 )
 
 
 @dataclass
 class BpttPolicyLearnerCfg:
   lr: float = 2e-4
+  all_adam: bool = False
   num_batches: int = 1
   batch_size: int = 4096
+  microbatch_size: int | None = None
   noise: float = 0.1
   horizon: int = 32
   gamma: float = 1.0
@@ -34,6 +37,7 @@ class BpttPolicyLearnerCfg:
 class ActorCriticPolicyLearnerCfg(BpttPolicyLearnerCfg):
   gamma: float = 0.99
   lam: float = 0.95
+  shuffle_each_epoch: bool = False
 
 
 def gae_returns(
@@ -73,7 +77,11 @@ class BpttPolicyLearner:
     self.cfg = cfg
     self.actor_params = list(self.actor.parameters())
     self.actor_optimizers = build_optimizers(
-      [self.actor], self.cfg.lr, betas=(0.9, self.cfg.beta2), device=device
+      [self.actor],
+      self.cfg.lr,
+      betas=(0.9, self.cfg.beta2),
+      device=device,
+      all_adam=cfg.all_adam,
     )
     self._rollout_actor = (
       torch.compile(self.actor) if torch.device(device).type == "cuda" else self.actor
@@ -85,7 +93,19 @@ class BpttPolicyLearner:
     for module in (self.wm_env.dynamics, self.wm_env.representation):
       module.eval()
       module.requires_grad_(False)
-    starts = [self.wm_env.sample_initial_states() for _ in range(self.cfg.num_batches)]
+    starts = []
+    for _ in range(self.cfg.num_batches):
+      if self.cfg.microbatch_size is None:
+        starts.append(self.wm_env.sample_initial_states())
+      else:
+        starts.append(
+          torch.cat(
+            [
+              self.wm_env.sample_initial_states()
+              for _ in range(self.cfg.batch_size // self.cfg.microbatch_size)
+            ]
+          )
+        )
     return self._captured_update(torch.stack(starts))
 
   def _update_from(self, starts: TensorDict) -> dict[str, torch.Tensor]:
@@ -99,6 +119,32 @@ class BpttPolicyLearner:
 
   def _train_batch(self, start: TensorDict) -> dict[str, torch.Tensor]:
     """Imagine one rollout from ``start`` and take one actor step on its return."""
+    for optimizer in self.actor_optimizers:
+      optimizer.zero_grad(set_to_none=True)
+    blocks = (
+      start.split(self.cfg.microbatch_size, dim=0)
+      if self.cfg.microbatch_size
+      else [start]
+    )
+    trajectories, last_states = [], []
+    totals = {}
+    for block in blocks:
+      weight = len(block) / len(start)
+      loss, rollout, last, stats = self._imagine(block)
+      (weight * loss).backward()
+      trajectories.append(rollout)
+      last_states.append(last)
+      for key, value in stats.items():
+        totals[key] = totals.get(key, 0) + weight * value
+    totals["grad_norm"] = step_with_gradients(
+      self.actor_optimizers, self.actor_params, 1.0, self.cfg.grad_clip_value
+    )
+    # Preserve the time-major layout of the unsplit batch before GAE and shuffling.
+    steps = trajectories[0] if len(blocks) == 1 else torch.cat(trajectories, dim=1)
+    last = last_states[0] if len(blocks) == 1 else torch.cat(last_states)
+    return totals | self._fit_critic(steps, last)
+
+  def _imagine(self, start: TensorDict):
     cfg = self.cfg
     obs = self.wm_env.reset(start)
     ret, aux_loss, survival = 0.0, 0.0, 1.0
@@ -115,15 +161,11 @@ class BpttPolicyLearner:
       obs = next_obs
     ret = ret + self._bootstrap(obs, survival, term_prob)
     loss = (-ret + aux_loss).mean()
-    grad_norm = _optimize_step(
-      self.actor_optimizers, loss, self.actor_params, 1.0, cfg.grad_clip_value
-    )
-    return {
+    stats = {
       "return": ret.mean().detach(),
-      "grad_norm": grad_norm,
-      **self._fit_critic(rollout, obs),
       **getattr(self.actor, "auxiliary_stats", lambda: {})(),
     }
+    return loss, torch.stack(rollout), obs["critic"].detach(), stats
 
   def _bootstrap(
     self, obs: TensorDict, survival: torch.Tensor, term_prob: torch.Tensor
@@ -133,10 +175,10 @@ class BpttPolicyLearner:
     return 0.0
 
   def _fit_critic(
-    self, rollout: list[TensorDict], last_obs: TensorDict
+    self, steps: TensorDict, last_state: torch.Tensor
   ) -> dict[str, torch.Tensor]:
     """Fit a critic to the rollout after the actor step."""
-    del rollout, last_obs
+    del steps, last_state
     return {}
 
   def _graph_state(self) -> list[torch.Tensor]:
@@ -159,7 +201,9 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
   ):
     super().__init__(policy, wm_env, cfg, device)
     self.critic = critic
-    self.critic_optimizers = build_optimizers([critic], self.cfg.lr, device=device)
+    self.critic_optimizers = build_optimizers(
+      [critic], self.cfg.lr, device=device, all_adam=cfg.all_adam
+    )
     self._v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)
 
   def _bootstrap(
@@ -171,12 +215,11 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     return self.cfg.gamma**self.cfg.horizon * value * alive
 
   def _fit_critic(
-    self, rollout: list[TensorDict], last_obs: TensorDict
+    self, steps: TensorDict, last_state: torch.Tensor
   ) -> dict[str, torch.Tensor]:
-    steps = torch.stack(rollout)
     with torch.no_grad():
       values = self.critic(steps["critic"])
-      last_value = self.critic(last_obs["critic"])
+      last_value = self.critic(last_state)
     returns = gae_returns(
       values,
       last_value,
@@ -189,7 +232,9 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     perm = torch.randperm(len(returns) // 4 * 4, device=returns.device)
     self.critic.requires_grad_(True)
     losses = []
-    for _ in range(5):
+    for epoch in range(5):
+      if epoch and self.cfg.shuffle_each_epoch:
+        perm = torch.randperm(len(perm), device=returns.device)
       for idx in perm.view(4, -1):
         loss = (returns[idx] - self.critic(obs[idx])).pow(2).mean()
         _optimize_step(

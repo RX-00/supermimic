@@ -4,9 +4,11 @@
 
 SuperMimic trains a humanoid whole-body motion tracker with one differentiable world model, built on [mjlab](https://github.com/mujocolab/mjlab).
 
-The `dev_5090` branch contains the local training/evaluation baseline and the
-[single-5090 reproduction plan](REPRODUCTION_5090.md), including the next-chat
-goal prompt and the remaining gaps in sensor-only policy performance.
+The `dev_5090` sensor-only GenCoord policy passed the local benchmark on one RTX 5090.
+After 300k training iterations with collection action noise disabled, the same checkpoint
+failed 3 and 5 of 129,491 clips in two full sweeps. Both averaged 0.95981 equal-clip
+normalized return. Training took 14 h 13 min. The original 320k run with collection
+action noise failed 461 and 466 clips. [Checkpoint, commands, results and playback](REPRODUCTION_5090.md).
 
 ## Setup
 
@@ -171,8 +173,24 @@ and update frequency). HoloMotion has an existing
 [microbatch implementation](https://github.com/HorizonRobotics/HoloMotion/blob/f52dd81ae935a828b0296f5ee0f833beb7378bf0/holomotion/src/algo/supermimic/imagination.py)
 and recommends it for actor-memory limits. Its reported 5090 experiment used
 40 LAFAN1 clips and a 24-step horizon, so it is an implementation reference, not
-a validation of full BONES-SEED or our MaxCoord task. No memory-saving changes
-have been applied to the training implementation for this experiment.
+a validation of full BONES-SEED or our MaxCoord task. The four baseline runs used unsplit batches. The 2026-11-18 reproduction adds
+validated actor gradient accumulation for the effective batch of 4,096.
+
+### One-GPU sensor-only reproduction
+
+The paper-recipe launcher selects GenCoord, ten proprioceptive frames, motion-only
+slots, eight scored WM transitions, Adam and cosine decay. The legacy CLI defaults
+continue to load the four baseline configurations. On this 5090 the unsplit 4,096
+profile exhausted memory. The accumulation mode splits imagination across
+microbatches, clips the full gradient once, takes one actor step, and fits the
+critic to all imagined samples. The [run plan](REPRODUCTION_5090.md) records
+measured feasibility, progress and the current acceptance status.
+
+Use `--runner.immutable-snapshots True` to save a separate weights directory
+at each completed save interval. To evaluate that exact checkpoint, pass
+`--snapshot /path/to/iteration-004000` in place of `--wandb-path` in the
+evaluation command below. The evaluator verifies the saved weight hashes and
+rebuilds the recorded runner configuration before starting the sweep.
 
 ### Unattended training
 
@@ -314,8 +332,9 @@ coverage. Stable training rewards were insufficient evidence of convergence.
 The million-iteration policies receive privileged simulator state, so their
 results do not establish deployable proprioceptive-policy quality. Duration,
 observations, optimizer/schedule, and dataset differences prevent attributing the
-gap to policy batch size. Keep the working 2,048 batch baseline; these results
-do not yet justify adding memory-saving training code or restarting training.
+gap to policy batch size. Keep the working 2,048 batch baseline for comparison.
+The next experiment tests the documented one-GPU recipe as a whole. Its first
+full-library memory pilot determines whether the actor needs gradient accumulation.
 
 Play the million-iteration checkpoints locally:
 

@@ -17,6 +17,7 @@ from supermimic.scripts.train_utils import (
   download_registry_motions,
   setup_device,
 )
+from supermimic.tasks.env_cfgs import ReturnMotionCommandCfg
 
 
 @dataclass
@@ -81,6 +82,16 @@ def main() -> None:
   args.env.commands["motion"].sampling_mode = (
     "external" if args.runner.sampling_mode == "return" else args.runner.sampling_mode
   )
+
+  bin_seconds = args.runner.return_sampler.bin_seconds
+  if bin_seconds is not None:
+    command = args.env.commands["motion"]
+    args.env.commands["motion"] = ReturnMotionCommandCfg(
+      **vars(command), bin_seconds=bin_seconds
+    )
+  if args.runner.episode_sim_context:
+    for name in ("base_com", "encoder_bias", "foot_friction"):
+      args.env.events[name].mode = "reset"
 
   env = create_env(args.env, args.num_envs, device)
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shutil
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -16,6 +18,7 @@ from tensordict import TensorDict
 
 from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
+from supermimic.learners.learner_utils import cosine_lr
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   ActorCriticPolicyLearnerCfg,
@@ -56,6 +59,7 @@ class BaseRunnerCfg:
   log_interval: int = 10
   save_interval: int = 1000
   history_length: int = 1
+  gencoord_encoder_bias: bool = False
   termination_softness: float = 0.05
   dynamics_hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
@@ -70,6 +74,10 @@ ActorCriticCfg = Annotated[
 @dataclass
 class SuperMimicRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 1000000
+  cosine_decay_iterations: int = 0
+  immutable_snapshots: bool = False
+  episode_sim_context: bool = False
+  share_reset_sensor: bool = False
   replay_ratio: int = 16
   latent_dim: int = 32
   actor_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256)
@@ -147,6 +155,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     env.unwrapped.cfg.decimation,
     default_joint_pos,
     actor_obs_mode=cfg.actor_obs,
+    gencoord_encoder_bias=cfg.gencoord_encoder_bias,
   ).to(device)
 
   representation.bind(env.unwrapped, sim_context)
@@ -523,17 +532,27 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     policy_cfg = self.cfg.policy
 
+    microbatch = policy_cfg.microbatch_size
+    if microbatch is not None:
+      if microbatch < 1 or policy_cfg.batch_size % microbatch:
+        raise ValueError(
+          "microbatch size must be a positive divisor of policy batch size"
+        )
+      if len(self._active_task_specs) != 1:
+        raise ValueError("policy microbatching requires a single active task")
+
     self.wm_env = MultiTaskWorldModelEnv(
       dynamics=self._dynamics,
       representation=self._representation,
       env=self.env,
-      batch_size=policy_cfg.batch_size,
+      batch_size=microbatch or policy_cfg.batch_size,
       replay_buffer=self.replay_buffer,
       task_specs=self._active_task_specs,
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
       device=self.device,
     )
+    self.wm_env.share_reset_sensor = self.cfg.share_reset_sensor
     if torch.cuda.is_available():
       self.wm_env.step = torch.compile(self.wm_env.step)
       self.wm_env.reset = torch.compile(self.wm_env.reset)
@@ -668,6 +687,21 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       * self.cfg.replay_ratio
     )
 
+    scheduled_groups = []
+    if self.cfg.cosine_decay_iterations:
+      policy = self.policy_learner
+      for optimizers, initial in (
+        (self.world_model_learner.optimizers, self.cfg.wm.lr),
+        (policy.actor_optimizers, self.cfg.policy.lr),
+        (getattr(policy, "critic_optimizers", []), self.cfg.policy.lr),
+      ):
+        for optimizer in optimizers:
+          for group in optimizer.param_groups:
+            if not isinstance(group["lr"], torch.Tensor):
+              raise ValueError("cosine decay requires tensor learning rates (all Adam)")
+            scheduled_groups.append((group["lr"], initial))
+    cycles = warmup_skips = 0
+    run_start = time.monotonic()
     num_collected_steps = 0
     start_time = time.time()
     wm_learn_time = 0.0
@@ -681,11 +715,14 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       num_collected_steps += self.step()
 
       for _ in range(should_train(step)):
-        if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
+        if self.replay_buffer.num_transitions < self.cfg.wm.window_records:
+          warmup_skips += 1
           continue
+        for rate, initial in scheduled_groups:
+          rate.fill_(cosine_lr(initial, step, self.cfg.cosine_decay_iterations))
 
         data = (
-          self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
+          self.replay_buffer.sample(self.cfg.wm.window_records, self.cfg.wm.batch_size)
           for _ in range(self.cfg.wm.num_batches)
         )
 
@@ -697,6 +734,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         policy_logs = self.policy_learner.update()
         policy_learn_time += time.time() - start_policy_time
 
+        cycles += 1
         loss_dict.update(wm_logs)
         loss_dict.update(policy_logs)
 
@@ -705,6 +743,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         total_train_time = wm_learn_time + policy_learn_time
         collect_time = elapsed_time - total_train_time
 
+        loss_dict["Train/collection_iterations"] = step + 1
+        loss_dict["Train/learner_cycles"] = cycles
+        loss_dict["Train/warmup_skips"] = warmup_skips
+        if scheduled_groups:
+          loss_dict["Train/actor_lr"] = self.policy_learner.actor_optimizers[
+            0
+          ].param_groups[0]["lr"]
         self.logger.log(
           it=log_count,
           total_it=self.cfg.max_iterations // self.cfg.log_interval,
@@ -721,7 +766,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         policy_learn_time = 0
         num_collected_steps = 0
 
-      if step % self.cfg.save_interval == 0 or step == self.cfg.max_iterations - 1:
+      save_step = step + 1 if self.cfg.immutable_snapshots else step
+      if save_step % self.cfg.save_interval == 0 or step == self.cfg.max_iterations - 1:
         assert wandb.run is not None  # _init_wandb ran before the loop
         # The previous version must be logged before its files are overwritten.
         if upload is not None:
@@ -736,6 +782,56 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           critic_path = str(log_dir / "critic.pt")
           torch.save(critic.state_dict(), critic_path)
           checkpoint_files.append(critic_path)
+        if self.cfg.immutable_snapshots:
+          from supermimic.utils.wandb_artifacts import checkpoint_hashes
+
+          snapshot = log_dir / f"iteration-{step + 1:06d}"
+          snapshot.mkdir()
+          for path in checkpoint_files:
+            shutil.copyfile(path, snapshot / Path(path).name)
+          record = {
+            "task_id": self.task_id,
+            "wandb_path": wandb.run.path,
+            "completed_iterations": step + 1,
+            "elapsed_seconds": time.monotonic() - run_start,
+            "learner_cycles": cycles,
+            "warmup_skips": warmup_skips,
+            "wm_steps": cycles * self.cfg.wm.num_batches,
+            "actor_steps": cycles * self.cfg.policy.num_batches,
+            "critic_steps": cycles * self.cfg.policy.num_batches * 20
+            if critic is not None
+            else 0,
+            "replay_records_per_env": self.replay_buffer.num_transitions,
+            "runner_cfg": asdict(self.cfg),
+            "sha256": checkpoint_hashes(snapshot),
+          }
+          if self.cfg.wm.all_adam and self.cfg.policy.all_adam:
+            for key, optimizers in (
+              ("wm_steps", self.world_model_learner.optimizers),
+              ("actor_steps", self.policy_learner.actor_optimizers),
+              ("critic_steps", getattr(self.policy_learner, "critic_optimizers", [])),
+            ):
+              counts = [
+                state["step"]
+                for opt in optimizers
+                for state in opt.state.values()
+                if state
+              ]
+              if counts:
+                actual = torch.stack(counts)
+                if not (actual == record[key]).all().item():
+                  raise RuntimeError(
+                    f"{key} disagrees with live Adam state: {actual.tolist()}"
+                  )
+              elif record[key]:
+                raise RuntimeError(f"{key} has no live Adam state")
+          if torch.device(self.device).type == "cuda":
+            record["peak_allocated_bytes"] = torch.cuda.max_memory_allocated(
+              self.device
+            )
+            record["peak_reserved_bytes"] = torch.cuda.max_memory_reserved(self.device)
+            record["free_device_bytes"] = torch.cuda.mem_get_info(self.device)[0]
+          (snapshot / "snapshot.json").write_text(json.dumps(record, indent=2) + "\n")
         # Skip ONNX export on huge datasets.
         if (
           self._representation.actor_obs_mode == "proprio"
@@ -750,5 +846,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           )
         upload = uploader.submit(log_model_artifact, checkpoint_files)
 
+    if upload is not None:
+      upload.result()
     uploader.shutdown()
     self._cleanup()

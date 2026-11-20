@@ -396,3 +396,15 @@ def test_sample_causal_pads_at_buffer_start():
   assert (stamps <= newest[:, None]).all() and (stamps >= 0).all()
   # Sampling the very first frame pads every predecessor slot.
   assert padded[at_start][:, :-1].all()
+
+
+@pytest.mark.parametrize("ending", ["terminated", "truncated"])
+def test_nine_records_for_eight_transitions_across_circle(ending):
+  buffer = ReplayBuffer(_schema(), buffer_size=15, num_envs=4)
+  for i in range(20):
+    buffer.insert(_step_td(4, float(i), **{ending: i == 10}))
+  data = buffer.sample(sequence_length=9, batch_size=128)
+  # Ring holds ages stamped 5..19. Only the post-reset 11..19 window is legal.
+  torch.testing.assert_close(
+    data["state"][:, :, 0], torch.arange(11, 20.0).expand(128, 9)
+  )

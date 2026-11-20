@@ -46,6 +46,24 @@ def download_artifact_cached(artifact: Any) -> Path:
   return Path(path)
 
 
+def checkpoint_hashes(directory: Path) -> dict[str, str]:
+  hashes = {}
+  for name in ("actor.pt", "world_model.pt", "critic.pt"):
+    path = directory / name
+    if name == "critic.pt" and not path.exists():
+      continue
+    with path.open("rb") as source:
+      hashes[name] = hashlib.file_digest(source, "sha256").hexdigest()
+  return hashes
+
+
+def verified_snapshot(directory: Path, task_id: str) -> dict:
+  record = json.loads((directory / "snapshot.json").read_text())
+  if task_id != record["task_id"] or checkpoint_hashes(directory) != record["sha256"]:
+    raise ValueError("snapshot task or checkpoint digest mismatch")
+  return record
+
+
 def download_model_dir(run: Any) -> Path:
   """Local dir of a run's ``:latest`` model-checkpoint artifact (digest-cached)."""
   artifact = next(

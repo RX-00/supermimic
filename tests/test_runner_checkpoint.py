@@ -50,3 +50,20 @@ def test_final_checkpoint_contains_final_weights(
     torch.load(tmp_path / "actor.pt", weights_only=True)["weight"].item() == iterations
   )
   runner._cleanup.assert_called_once()
+
+
+def test_snapshot_verification_rejects_substitution(tmp_path):
+  import json
+
+  from supermimic.utils.wandb_artifacts import checkpoint_hashes, verified_snapshot
+
+  for name in ("actor.pt", "world_model.pt", "critic.pt"):
+    (tmp_path / name).write_bytes(name.encode())
+  record = {"task_id": "task", "sha256": checkpoint_hashes(tmp_path)}
+  (tmp_path / "snapshot.json").write_text(json.dumps(record))
+  assert verified_snapshot(tmp_path, "task") == record
+  with pytest.raises(ValueError, match="mismatch"):
+    verified_snapshot(tmp_path, "other")
+  (tmp_path / "actor.pt").write_bytes(b"later actor")
+  with pytest.raises(ValueError, match="mismatch"):
+    verified_snapshot(tmp_path, "task")

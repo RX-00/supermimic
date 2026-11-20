@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -26,14 +26,19 @@ from supermimic.runners.supermimic_runner import (
   build_world_model,
 )
 from supermimic.tasks.task_spec import build_actor_obs_td
-from supermimic.utils.wandb_artifacts import download_model_dir
+from supermimic.utils.wandb_artifacts import (
+  checkpoint_hashes,
+  download_model_dir,
+  verified_snapshot,
+)
 
 
 @dataclass
 class EvalConfig:
-  wandb_path: str
   motion_file: str
   output: Path
+  wandb_path: str | None = None
+  snapshot: Path | None = None
   num_envs: int = 256
   device: str = "cuda:0"
   seed: int = 0
@@ -279,13 +284,25 @@ def evaluate(task_id: str, cfg: EvalConfig) -> None:
     raise ValueError("num_envs/limit must be positive and start_motion nonnegative")
   if cfg.video and cfg.num_envs != 1:
     raise ValueError("Video recording requires --num-envs 1")
+  start = time.monotonic()
   configure_torch_backends(deterministic=True)
-  import wandb
+  if (cfg.snapshot is None) == (cfg.wandb_path is None):
+    raise ValueError("select one checkpoint with --snapshot or --wandb-path")
+  if cfg.snapshot is not None:
+    model_dir = cfg.snapshot
+    record = verified_snapshot(model_dir, task_id)
+    hashes = record["sha256"]
+    runner_cfg = load_runner_cfg(record)
+    wandb_path, run_state = record["wandb_path"], "local snapshot"
+  else:
+    import wandb
 
-  run = wandb.Api().run(cfg.wandb_path)
-  runner_cfg = load_runner_cfg(run.config)
+    run = wandb.Api().run(cfg.wandb_path)
+    runner_cfg = load_runner_cfg(run.config)
+    model_dir = download_model_dir(run)
+    hashes = checkpoint_hashes(model_dir)
+    wandb_path, run_state = cfg.wandb_path, run.state
   check_representation_matches(task_id, runner_cfg.representation)
-  model_dir = download_model_dir(run)
   env_cfg = load_env_cfg(task_id, play=True)
   configure_evaluation(env_cfg)
   env_cfg.seed = cfg.seed
@@ -294,18 +311,18 @@ def evaluate(task_id: str, cfg: EvalConfig) -> None:
   assert isinstance(motion_cfg, MotionCommandCfg)
   motion_cfg.motion_file = str(Path(cfg.motion_file).expanduser())
   cfg.output.mkdir(parents=True, exist_ok=False)
-  checkpoint_hashes = {}
-  for name in ("actor.pt", "world_model.pt"):
-    with (model_dir / name).open("rb") as source:
-      checkpoint_hashes[name] = hashlib.file_digest(source, "sha256").hexdigest()
   metadata = {
     "complete": False,
     "task_id": task_id,
-    "wandb_path": cfg.wandb_path,
-    "run_state": run.state,
+    "wandb_path": wandb_path,
+    "run_state": run_state,
     "runner_cfg": asdict(runner_cfg),
-    "evaluation_cfg": {**asdict(cfg), "output": str(cfg.output)},
-    "checkpoint_sha256": checkpoint_hashes,
+    "evaluation_cfg": {
+      **asdict(cfg),
+      "output": str(cfg.output),
+      "snapshot": str(cfg.snapshot) if cfg.snapshot else None,
+    },
+    "checkpoint_sha256": hashes,
     "protocol": {
       "paper": "https://arxiv.org/abs/2610.28480v2",
       "sections": "4 (normalized return), A (reward/termination), F (benchmark)",
@@ -366,6 +383,7 @@ def evaluate(task_id: str, cfg: EvalConfig) -> None:
     metadata.update(
       {
         "complete": True,
+        "elapsed_seconds": time.monotonic() - start,
         "loaded_motions": total,
         "evaluated_motions": len(results),
         "failed_motions": sum(r.failed for r in results),

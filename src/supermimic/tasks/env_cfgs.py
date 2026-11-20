@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from math import ceil
 from typing import cast
 
 import mjlab.envs.mdp as mdp
@@ -10,7 +12,7 @@ from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.managers import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
-from mjlab.tasks.tracking.mdp.commands import MotionCommand
+from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionCommandCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from supermimic.representations import (
@@ -21,6 +23,24 @@ from supermimic.representations import (
 )
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
+
+
+@dataclass(kw_only=True)
+class ReturnMotionCommandCfg(MotionCommandCfg):
+  """Use mjlab's external reset distribution with the requested bin duration."""
+
+  bin_seconds: float
+
+  def build(self, env: ManagerBasedRlEnv) -> MotionCommand:
+    if self.sampling_mode != "external" or self.bin_seconds <= 0:
+      raise ValueError("return bins require external sampling and a positive duration")
+    command = super().build(env)
+    count = ceil(command.motion.time_step_total * env.step_dt / self.bin_seconds)
+    command.bin_count = count
+    command.bin_failed_count = command.bin_failed_count.new_zeros(count)
+    command._current_bin_failed = command.bin_failed_count.clone()
+    command.set_sampling_distribution(command.bin_failed_count.new_ones(count))
+    return command
 
 
 def _make_asset_obs_fn(attr_name: str, *, subtract_origins: bool = False):

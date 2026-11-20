@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Callable, Iterable, Sequence
 
 import torch
@@ -15,6 +16,7 @@ def build_optimizers(
   lr: float,
   betas: tuple[float, float] = (0.9, 0.999),
   device: str = "cpu",
+  all_adam: bool = False,
 ) -> list[torch.optim.Optimizer]:
   """Muon on the Linear weights between the first and the last Linear of each
   ``nn.Sequential`` in ``modules``, fused capturable Adam on the rest, both at
@@ -22,6 +24,7 @@ def build_optimizers(
   hidden = [
     linear.weight
     for module in modules
+    if not all_adam
     for seq in module.modules()
     if isinstance(seq, nn.Sequential)
     for linear in [m for m in seq if isinstance(m, nn.Linear)][1:-1]
@@ -36,6 +39,12 @@ def build_optimizers(
   return [adam, torch.optim.Muon(hidden, lr=lr, adjust_lr_fn="match_rms_adamw")]
 
 
+def cosine_lr(initial: float, iteration: int, decay_iterations: int) -> float:
+  """Cosine annealing in collection iterations, with a 3% floor."""
+  progress = min(iteration / decay_iterations, 1.0)
+  return initial * (0.03 + 0.97 * (1.0 + math.cos(math.pi * progress)) / 2.0)
+
+
 def _optimize_step(
   optimizers: Sequence[torch.optim.Optimizer],
   loss: torch.Tensor,
@@ -47,6 +56,16 @@ def _optimize_step(
   for optimizer in optimizers:
     optimizer.zero_grad(set_to_none=True)
   loss.backward()
+  return step_with_gradients(optimizers, params, max_norm, clip_value)
+
+
+def step_with_gradients(
+  optimizers: Sequence[torch.optim.Optimizer],
+  params: Iterable[torch.Tensor] | None,
+  max_norm: float | None,
+  clip_value: float = 0.0,
+) -> torch.Tensor | None:
+  """Clip the accumulated gradient once and apply each optimizer once."""
   grad_norm = None
   if params is not None and max_norm is not None:
     # Don't set error_if_nonfinite=True: it forces a per-step CPU<->GPU sync.

@@ -16,6 +16,8 @@ import torch
 
 @dataclass
 class ReturnSamplerCfg:
+  bin_seconds: float | None = None
+  square_historical_weights: bool = True
   gamma: float = 0.99
   """Discount of the measured return; sets v_max = max_step_reward / (1 - gamma)."""
   horizon: int = 20
@@ -147,7 +149,8 @@ class ReturnSampler:
   def _distribution(self) -> torch.Tensor:
     cfg = self.cfg
     focus = torch.softmax(-cfg.steepness * self.value / self.v_max, dim=0)
-    self.effort += focus.double().square()
+    weight = focus.double()
+    self.effort += weight.square() if cfg.square_historical_weights else weight
     keep = (self.effort / self.effort.sum()).float()
     explore = cfg.explore / self.bin_count
     return explore + (1.0 - cfg.explore - cfg.keep) * focus + cfg.keep * keep

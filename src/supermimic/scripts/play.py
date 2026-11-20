@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import mjlab.tasks  # noqa: F401
@@ -27,18 +28,20 @@ from supermimic.scripts.viewers import (
 from supermimic.utils.wandb_artifacts import (
   download_artifact_cached,
   download_model_dir,
+  verified_snapshot,
 )
 
 
 @dataclass
 class PlayConfig:
-  wandb_path: str
+  wandb_path: str | None = None
   motion_file: str | None = None
   initial_task: Literal["motion", "velocity"] = "motion"
   """Task selected when the viewer opens. Switch live via the GUI dropdown."""
   device: str | None = None
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
+  snapshot: Path | None = None
 
 
 def play(task_id: str, cfg: PlayConfig) -> None:
@@ -50,14 +53,24 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   env_cfg.scene.num_envs = 1
   env_cfg.observations["actor"].enable_corruption = True
 
-  import wandb
+  if (cfg.snapshot is None) == (cfg.wandb_path is None):
+    raise ValueError("select one checkpoint with --snapshot or --wandb-path")
+  if cfg.snapshot is not None:
+    if not cfg.motion_file:
+      raise ValueError("local snapshot playback requires --motion-file")
+    model_dir = cfg.snapshot
+    runner_cfg = load_runner_cfg(verified_snapshot(model_dir, task_id))
+    motion_artifacts = []
+  else:
+    import wandb
 
-  print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
-  run = wandb.Api().run(cfg.wandb_path)
-  runner_cfg = load_runner_cfg(run.config)
+    print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
+    run = wandb.Api().run(cfg.wandb_path)
+    runner_cfg = load_runner_cfg(run.config)
+    model_dir = download_model_dir(run)
+    motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
   check_representation_matches(task_id, runner_cfg.representation)
 
-  motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
   command_term = env_cfg.commands["motion"]
   assert isinstance(command_term, MotionCommandCfg)
   motion_names: list[str] = []
@@ -90,7 +103,6 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   representation = wm.representation
   dynamics = wm.dynamics
 
-  model_dir = download_model_dir(run)
   wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
   dynamics.eval()
 

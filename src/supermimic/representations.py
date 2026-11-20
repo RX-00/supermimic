@@ -61,11 +61,14 @@ def create_representation(
   decimation: int,
   default_joint_pos: torch.Tensor,
   actor_obs_mode: str,
+  gencoord_encoder_bias: bool = False,
 ) -> StateRepresentation:
   """Create a state representation wired up for training and reward compute."""
   if name == "gencoord":
     num_joints = infer_num_joints_from_state_dim(full_state_dim)
-    rep: StateRepresentation = GenCoordRepresentation(num_joints, default_joint_pos)
+    rep: StateRepresentation = GenCoordRepresentation(
+      num_joints, default_joint_pos, gencoord_encoder_bias
+    )
   elif name == "maxcoord":
     if full_state_dim % 13 != 0:
       raise ValueError(
@@ -481,17 +484,27 @@ class GenCoordRepresentation(StateRepresentation):
     "joint_vel": "nominal_error_joint_vel",
   }
 
-  def __init__(self, num_joints: int, default_joint_pos: torch.Tensor):
+  def __init__(
+    self,
+    num_joints: int,
+    default_joint_pos: torch.Tensor,
+    use_encoder_bias: bool = False,
+  ):
     super().__init__()
     self.num_joints = num_joints
     self.full_state_dim = 13 + 2 * num_joints
     self.rep_state_dim = rep_state_dim_from_num_joints(num_joints)
     self.prediction_dim = 6 + num_joints  # [Δv_b(3), Δw_b(3), Δvj(N)]
-    self._default_joint_pos = default_joint_pos
+    self.register_buffer("_default_joint_pos", default_joint_pos, persistent=False)
+    self._use_encoder_bias = use_encoder_bias
+    self._encoder_bias: tuple[slice, SimContext] | None = None
     self.fk: ForwardKinematics  # set by bind
 
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
     super().bind(env, sim_context)
+    if self._use_encoder_bias:
+      columns = sim_context.find("encoder_bias")
+      self._encoder_bias = None if columns is None else (columns, sim_context)
     self.fk = env.command_manager.get_term("motion").motion.fk
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
@@ -603,10 +616,14 @@ class GenCoordRepresentation(StateRepresentation):
     joint_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
-    del aux_state, sim_ctx
+    del aux_state
     _, g_b, _, w_b, _, _ = decompose_rep_state(rep_state)
     qj, vj = joint_state.chunk(2, dim=-1)
-    return torch.cat([g_b, w_b, qj - self._default_joint_pos, vj], dim=-1)
+    joint_pos_rel = qj - self._default_joint_pos
+    if self._encoder_bias is not None:
+      columns, context = self._encoder_bias
+      joint_pos_rel = joint_pos_rel + context.denormalize(sim_ctx, columns)
+    return torch.cat([g_b, w_b, joint_pos_rel, vj], dim=-1)
 
 
 class MaxCoordRepresentation(StateRepresentation):

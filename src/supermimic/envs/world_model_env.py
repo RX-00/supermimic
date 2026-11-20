@@ -54,6 +54,7 @@ class WorldModelEnv(ABC):
     self.num_envs = batch_size
     self.replay_buffer = replay_buffer
     self.history_length = history_length
+    self.share_reset_sensor = False
 
     # Analytic per-step reward ceiling: positive tracking-reward weights, dt-scaled.
     self.max_step_reward = env.unwrapped.step_dt * sum(
@@ -227,6 +228,14 @@ class WorldModelEnv(ABC):
         batch["sensor_window"], batch["pad_mask"]
       )
     self._latest_sensor = self._synth_sensor()
+    if self.history_length > 1 and self.share_reset_sensor:
+      # At a sampled first frame every predecessor is padding. Collection repeats
+      # its single noisy current sensor across the entire history in this case.
+      self._past_sensors = torch.where(
+        batch["pad_mask"][:, -2, None, None],
+        self._latest_sensor.unsqueeze(1),
+        self._past_sensors,
+      )
 
   def _compute_commands(self) -> None:
     """Advance the reference clip one frame (clamped at clip ends) and refresh."""

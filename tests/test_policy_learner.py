@@ -109,3 +109,123 @@ def test_gae_returns_discount_by_soft_done():
   )
 
   assert torch.allclose(returns, torch.tensor([[1.495], [1.0]]))
+
+
+def test_paper_cycle_has_one_actor_step_and_twenty_critic_steps():
+  cfg = ActorCriticPolicyLearnerCfg(horizon=2, all_adam=True, shuffle_each_epoch=True)
+  learner = ActorCriticPolicyLearner(
+    _DummyActor(), _ConstantCritic(1.0), _TwoStepEnv(), cfg
+  )
+  learner.update()
+  assert learner.actor_optimizers[0].state[learner.actor.weight]["step"].item() == 1
+  assert learner.critic_optimizers[0].state[learner.critic.value]["step"].item() == 20
+
+
+class _FixedRollout:
+  """Fixed per-sample sensor noise and a differentiable, action-dependent state."""
+
+  max_step_reward = 100.0
+
+  def __init__(self, device):
+    self.dynamics = nn.Linear(1, 1).to(device)
+    self.representation = _DummyRepresentation()
+
+  def reset(self, batch):
+    self.x = batch["x"]
+    self.noise = batch["noise"]
+    return self._obs()
+
+  def _obs(self):
+    return TensorDict({"critic": self.x, "actor": self.x + self.noise}, [len(self.x)])
+
+  def step(self, actions):
+    self.x = self.x + 0.2 * actions
+    reward = 5 * self.x.sum(dim=-1)
+    return self._obs(), reward, self.x[:, 0].sigmoid(), {}
+
+
+@pytest.mark.parametrize("captured", [False, True])
+def test_accumulation_matches_unsplit_gradients_and_adam(monkeypatch, captured):
+  import copy
+
+  from supermimic.learners import policy_learner as module
+
+  if captured and not torch.cuda.is_available():
+    pytest.skip("CUDA graph comparison requires a GPU")
+  device = "cuda" if captured else "cpu"
+  torch.manual_seed(41)
+  actor = nn.Linear(3, 3).to(device)
+
+  class SensorActor(nn.Sequential):
+    def forward(self, obs):
+      output = super().forward(obs["actor"])
+      self.aux = 0.02 * output.square().mean(-1)
+      return output
+
+    def auxiliary_loss(self):
+      return self.aux
+
+  actor = SensorActor(actor)
+  critic = nn.Linear(3, 1).to(device)
+  starts = TensorDict(
+    {
+      "x": torch.randn(8, 3, device=device),
+      "noise": torch.randn(8, 3, device=device) * 0.05,
+    },
+    [8],
+  )
+  # Use the same nontrivial permutation in both implementations, including replay.
+  monkeypatch.setattr(
+    torch, "randperm", lambda n, device: torch.arange(n - 1, -1, -1, device=device)
+  )
+  full, split = [
+    ActorCriticPolicyLearner(
+      copy.deepcopy(actor),
+      copy.deepcopy(critic),
+      _FixedRollout(device),
+      ActorCriticPolicyLearnerCfg(
+        batch_size=8, microbatch_size=micro, horizon=3, all_adam=True
+      ),
+      device=device,
+    )
+    for micro in (None, 4)
+  ]
+  measured = {}
+  real_step = module.step_with_gradients
+
+  def capture(optimizers, params, max_norm, clip_value):
+    key = id(optimizers[0])
+    before = torch.cat([p.grad.flatten() for p in params]).clone()
+    norm = real_step(optimizers, params, max_norm, clip_value)
+    measured[key] = (before, torch.cat([p.grad.flatten() for p in params]).clone())
+    return norm
+
+  monkeypatch.setattr(module, "step_with_gradients", capture)
+  for _ in range(6 if captured else 2):
+    # The reference is eager even during comparison with CUDA graph replay.
+    ref = full._update_from(starts.unsqueeze(0))
+    actual = split._captured_update(starts.unsqueeze(0))
+    for name in ref:
+      torch.testing.assert_close(ref[name], actual[name], atol=2e-5, rtol=2e-5)
+    for a, b in zip(
+      measured[id(full.actor_optimizers[0])],
+      measured[id(split.actor_optimizers[0])],
+      strict=True,
+    ):
+      torch.testing.assert_close(a, b, atol=2e-5, rtol=2e-5)
+    for network, optim in [
+      ("actor", "actor_optimizers"),
+      ("critic", "critic_optimizers"),
+    ]:
+      for a, b in zip(
+        getattr(full, network).parameters(),
+        getattr(split, network).parameters(),
+        strict=True,
+      ):
+        torch.testing.assert_close(a, b, atol=2e-6, rtol=2e-5)
+        ref_state = getattr(full, optim)[0].state[a]
+        got_state = getattr(split, optim)[0].state[b]
+        for key in ["step", "exp_avg", "exp_avg_sq"]:
+          torch.testing.assert_close(
+            ref_state[key], got_state[key], atol=2e-5, rtol=2e-5
+          )

@@ -219,3 +219,18 @@ class TestLossBlocks:
     )
     torch.cat(list(last.values()), dim=-1).pow(2).mean().backward()
     assert init_aux.grad is not None and float(init_aux.grad.abs().sum()) > 0.0
+
+
+def test_transition_horizon_scores_eighth_successor():
+  learner, rep, cfg = _make_learner("gencoord", horizon_counts_transitions=True)
+  states = _random_full_states(rep, 2, cfg.window_records)
+  actions = _randn(2, cfg.window_records, NUM_ACTIONS)
+  rep_state, aux = rep.represent(states), rep.extract_aux_state(states)
+  pred, pred_aux = learner._rollout(
+    rep_state[:, 0], actions, aux[:, 0], torch.zeros(2, 1)
+  )
+  assert pred.shape[1] == 8
+  target = pred.detach().clone()
+  target[:, 7, _rep_state_sources("gencoord")[0]["joint_pos"]] += 0.1
+  loss, _ = learner._compute_losses(pred, pred_aux, target, pred_aux.detach())
+  assert loss.item() > 0

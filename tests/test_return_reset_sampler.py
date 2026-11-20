@@ -163,3 +163,16 @@ GOLDEN = [
   0.0314665,
   0.13254566,
 ]
+
+
+def test_linear_historical_focus_after_difficulty_reverses():
+  sampler = _sampler(square_historical_weights=False)
+  sampler.value[:] = torch.tensor([90.0, 94.0, 98.0, 99.0])
+  initial = (-25 * sampler.value / sampler.v_max).softmax(0)
+  sampler._distribution()
+  sampler.value[:] = torch.tensor([99.0, 98.0, 94.0, 90.0])
+  final = (-25 * sampler.value / sampler.v_max).softmax(0)
+  weights = sampler._distribution()
+  torch.testing.assert_close(
+    weights, 0.5 / 4 + 0.4 * final + 0.1 * (initial + final) / 2
+  )
