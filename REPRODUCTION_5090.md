@@ -2,6 +2,8 @@
 
 Prepared 2026-11-17. Working directory: /home/roy/supermimic. Branch: dev_5090.
 
+For a new checkout, start with the [policy quick start](README.md#quick-start) to download the exact weights and the [policy guide](docs/policies.md) to run them. The `logs/` links and absolute paths in this experiment record refer to evidence retained on the original training machine. The [accepted snapshot manifest](docs/checkpoints/gencoord-300k/snapshot.json) is included in Git.
+
 ## Confirmed sensor-only result on one RTX 5090 · November 20, 2026
 
 **The 300k GenCoord checkpoint passed the local acceptance test twice.** In separate evaluator processes, the same weights failed 3 and 5 of 129,491 clips and averaged 0.959808 in both sweeps. Both clear the limits of 30 failures and 0.85 equal-clip return. The successful run used ten proprioceptive frames, motion-only slots and zero action noise during real-simulator collection. The verified 320k run with the paper’s collection noise SD 0.1 missed the failure target. [Accepted snapshot](logs/SuperMimic-GenCoord-G1/2026-11-19_14-53-44/iteration-300000/snapshot.json) · [Verified W&B artifact `model-vt2ualwi:v29`](logs/reproduction-5090-20261118/zero-action-noise-300k/wandb-final.json) · [Run](https://wandb.ai/a2r-lab/supermimic/runs/vt2ualwi).
